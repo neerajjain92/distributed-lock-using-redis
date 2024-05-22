@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"time"
@@ -32,22 +33,32 @@ func NewRedisLock(clients []*redis.Client, lockKey string, ttl time.Duration) *R
 func (lock *RedisLock) AcquireLock() (bool, error) {
 	startTime := time.Now()
 	totalLocksAcquired := 0
+	MAX_ATTEMPTS := 100
+	counter := 0
+	for totalLocksAcquired != len(lock.clients) && counter < MAX_ATTEMPTS {
+		log.Printf("Attempt [%d] to acquire lock", counter)
+		totalLocksAcquired = lock.AcquireLockOnAllRedis(totalLocksAcquired)
+		// Check for quorum
+		quorum := len(lock.clients)/2 + 1
+		if totalLocksAcquired >= quorum && time.Since(startTime) < lock.ttl {
+			return true, nil
+		}
+		// If we didn't get the quorum, release all locks and retry
+		// Else just release the lock we couldn't get it faster
+		lock.ReleaseLock()
+		counter++
+	}
+	return false, fmt.Errorf("failed to aquire lock : %s", lock.lockKey)
+}
+
+func (lock *RedisLock) AcquireLockOnAllRedis(totalLocksAcquired int) int {
 	for _, client := range lock.clients {
 		result, err := client.SetNX(ctx, lock.lockKey, lock.uniqueValue, lock.ttl).Result()
 		if err == nil && result {
 			totalLocksAcquired++
 		}
 	}
-
-	// Check for quorum
-	quorum := len(lock.clients)/2 + 1
-	if totalLocksAcquired >= quorum && time.Since(startTime) < lock.ttl {
-		return true, nil
-	}
-
-	// Else just release the lock we couldn't get it faster
-	lock.ReleaseLock()
-	return false, fmt.Errorf("Failed to aquire lock : %s", lock.lockKey)
+	return totalLocksAcquired
 }
 
 func (lock *RedisLock) ReleaseLock() {
@@ -82,8 +93,7 @@ func main() {
 	for {
 		acquired, err := lock.AcquireLock()
 		if err != nil {
-			// fmt.Printf("Instance %s: Error acquiring lock: %v\n", instanceID, err)
-			continue
+			fmt.Printf("Instance %s: Error acquiring lock: %v\n", instanceID, err)
 		}
 
 		if acquired {
@@ -95,8 +105,15 @@ func main() {
 			lock.ReleaseLock()
 			fmt.Printf("Instance %s: Lock released!\n", instanceID)
 		} else {
-			fmt.Print(".")
-			time.Sleep(time.Duration(rand.Intn(10)+1) * time.Second)
+			startTime := time.Now()
+			baseSleep := time.Duration(rand.Intn(10)+1) * time.Second
+			jitter := time.Duration(rand.Intn(1000)) * time.Millisecond // up to 1 second of jitter
+			// Add jitter to the base sleep duration
+			sleepDuration := baseSleep + jitter
+			time.Sleep(sleepDuration)
+
+			log.Println("Retrying to acquire lock after %d seconds", time.Since(startTime)*time.Second)
+
 		}
 	}
 }
